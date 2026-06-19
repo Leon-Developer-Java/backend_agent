@@ -35,7 +35,8 @@ python main.py         # 监听 http://127.0.0.1:8004
 | 事件 | 形状 |
 |------|------|
 | 文本增量 | `{"type":"text","value":"…"}` |
-| 工具进行/完成 | `{"type":"tool","name":"run_model","status":"running|done","label":"…","progress":30,"result":"…"}` |
+| 工具进行/完成 | `{"type":"tool","name":"model_wrf","status":"running|done","label":"…","progress":30,"result":"…"}` |
+| 缺参补全 | `{"type":"need_params","model":"model_wrf","model_name":"…","fields":[…],"prompt":"…"}` |
 | 图片 | `{"type":"image","url":"http://127.0.0.1:8004/outputs/x.png","caption":"…"}` |
 | 结束 | `{"type":"done"}` |
 | 错误 | `{"type":"error","message":"…"}` |
@@ -49,8 +50,26 @@ python main.py         # 监听 http://127.0.0.1:8004
 ## 工具（MVP）
 
 - `query_weather_data(data_type?, variable?)`：扫描解析后端 `../backend/data/*/*.meta.json`；为空时返回示例清单。
-- `run_model(model, region?, time?)`：模型调用**桩**（wrf/radar_ext/era5/himawari），返回模拟结论 + 预测示意图。
 - `make_chart(title, series?)`：matplotlib 折线图 → PNG。
+- **6 个气象模型**（测试用占位逻辑）：`model_era5` / `model_gfs` / `model_cma` / `model_radar` /
+  `model_himawari` / `model_wrf`，每个返回结论文字 + 示意图。工具由 `services/models/` 下的 `SPEC`
+  自动生成，多人协作只改各自的模型文件，详见 [services/models/README.md](services/models/README.md)。
+
+### 模型参数补全流程
+
+模型工具的参数**不在 schema 里标 required**，因此大模型即使信息不全也会先调用，由注册表
+校验必填项：
+
+- 参数齐全 → 直接执行，流式返回 `tool` + `image` + 结论文本。
+- 缺必填参数 → 返回 `need_params` 事件（含字段与可选项），前端弹「选择/输入」卡片；用户补全后
+  作为新消息发回，大模型据上下文重新调用，直到参数齐全出结果。
+
+`need_params` 事件形状：
+```json
+{"type":"need_params","model":"model_wrf","model_name":"WRF 短临降水预测",
+ "fields":[{"name":"region","label":"区域","type":"select","options":["华北","华东",...],"required":true}],
+ "prompt":"调用【WRF 短临降水预测】还需要补充参数：区域。"}
+```
 
 ## 自测（无需前端）
 

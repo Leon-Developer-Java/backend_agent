@@ -108,7 +108,9 @@ def _run_with_llm(history: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
                 args = json.loads(call["function"]["arguments"] or "{}")
             except json.JSONDecodeError:
                 args = {}
-            yield from _exec_tool(call["id"], name, args, messages)
+            stop = yield from _exec_tool(call["id"], name, args, messages)
+            if stop:
+                return  # 缺参：交回用户补全，结束本轮
 
     yield {"type": "text", "value": "\n（已达到工具调用上限，先汇报到这里。）"}
 
@@ -116,24 +118,34 @@ def _run_with_llm(history: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
 # ── 工具执行 + 事件 ─────────────────────────────────────────────────────
 
 def _exec_tool(call_id: str, name: str, args: dict[str, Any],
-               messages: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
-    label = tools.LABELS.get(name, "处理中")
+               messages: list[dict[str, Any]]):
+    """执行单个工具并产出事件。返回 True 表示需要停止本轮（缺参，等用户补全）。"""
+    label = tools.label_for(name)
     yield {"type": "tool", "name": name, "status": "running", "label": label, "progress": 30}
 
     result = tools.dispatch(name, args)
+
+    # 缺参：发结构化补全卡，并以文本说明，结束本轮
+    if result.get("status") == "need_params":
+        yield {"type": "tool", "name": name, "status": "done", "progress": 100, "result": "待补充参数"}
+        yield {"type": "need_params", "model": result["model"],
+               "model_name": result["model_name"], "fields": result["missing"],
+               "prompt": result["summary"]}
+        yield {"type": "text", "value": result["summary"]}
+        return True
+
     summary = result.get("summary", "")
     image_url = result.get("image_url")
-
     if image_url:
         yield {"type": "image", "url": image_url, "caption": label}
-
     yield {"type": "tool", "name": name, "status": "done", "progress": 100,
            "result": summary[:60] + ("…" if len(summary) > 60 else "")}
 
-    # 工具结果回填给模型
+    # 工具结果回填给模型，让其用自然语言总结
     messages.append({"role": "tool", "tool_call_id": call_id, "name": name,
                      "content": json.dumps({"summary": summary, "image_url": image_url},
                                            ensure_ascii=False)})
+    return False
 
 
 # ── 降级路径（无密钥时的本地关键词路由）────────────────────────────────
@@ -149,13 +161,18 @@ def _run_fallback(history: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
     yield {"type": "text",
            "value": "（提示：未配置 DeepSeek 密钥，当前为本地降级模式，按关键词调用工具。）\n\n"}
 
-    if any(k in user_text for k in ("预测", "外推", "跑模型", "调用模型")) or "model" in t:
-        model = ("radar_ext" if ("雷达" in user_text or "外推" in user_text)
-                 else "himawari" if ("葵花" in user_text or "云图" in user_text)
-                 else "era5" if "era5" in t
-                 else "wrf")
-        region = next((r for r in ("华北", "华东", "华南", "长三角", "京津冀") if r in user_text), None)
-        yield from _fallback_tool("run_model", {"model": model, "region": region})
+    if any(k in user_text for k in ("预测", "外推", "跑模型", "调用模型", "分析", "诊断")) or "model" in t:
+        model_id = ("model_radar" if ("雷达" in user_text or "外推" in user_text)
+                    else "model_himawari" if ("葵花" in user_text or "云图" in user_text)
+                    else "model_cma" if "cma" in t
+                    else "model_gfs" if ("gfs" in t or "ecmwf" in t)
+                    else "model_era5" if "era5" in t
+                    else "model_wrf")
+        args: dict[str, Any] = {}
+        region = next((r for r in ("华北", "华东", "华南", "西南", "西北", "东北", "全国") if r in user_text), None)
+        if region:
+            args["region"] = region
+        yield from _fallback_tool(model_id, args)
     elif any(k in user_text for k in ("图表", "画图", "出图", "可视化", "折线")):
         yield from _fallback_tool("make_chart", {"title": user_text[:16] or "气象图表"})
     else:
@@ -163,12 +180,20 @@ def _run_fallback(history: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
 
 
 def _fallback_tool(name: str, args: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    """降级模式：触发工具事件，并把工具 summary 直接作为文本流出。"""
-    label = tools.LABELS.get(name, "处理中")
+    """降级模式：触发工具事件；缺参则发补全卡，否则把 summary 作为文本流出。"""
+    label = tools.label_for(name)
     yield {"type": "tool", "name": name, "status": "running", "label": label, "progress": 30}
     result = tools.dispatch(name, args)
-    summary = result.get("summary", "")
+
+    if result.get("status") == "need_params":
+        yield {"type": "tool", "name": name, "status": "done", "progress": 100, "result": "待补充参数"}
+        yield {"type": "need_params", "model": result["model"],
+               "model_name": result["model_name"], "fields": result["missing"],
+               "prompt": result["summary"]}
+        yield {"type": "text", "value": result["summary"]}
+        return
+
     if result.get("image_url"):
         yield {"type": "image", "url": result["image_url"], "caption": label}
     yield {"type": "tool", "name": name, "status": "done", "progress": 100, "result": "已完成"}
-    yield {"type": "text", "value": summary}
+    yield {"type": "text", "value": result.get("summary", "")}

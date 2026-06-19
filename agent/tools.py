@@ -1,17 +1,20 @@
-"""工具定义（OpenAI function-calling schema）与分发表。
+"""工具定义与分发。
 
-每个工具返回 {"summary": str, "image_url": str|None}，便于 llm 层统一转成
-text / image 事件。
+- query_weather_data / make_chart：本地内置工具。
+- 6 个模型工具：从 services.models 注册表自动生成（开发者只改自己的模型文件）。
+
+返回结构统一带 "status"：ok / need_params / error，供 llm 层转成事件。
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Callable
+from typing import Any
 
 from services import data_query, models
 from services.plotting import line_chart
 
-# ── 工具实现 ────────────────────────────────────────────────────────────
+
+# ── 本地工具实现 ────────────────────────────────────────────────────────
 
 def _query_weather_data(data_type: str | None = None, variable: str | None = None) -> dict:
     result = data_query.list_datasets(data_type)
@@ -19,7 +22,6 @@ def _query_weather_data(data_type: str | None = None, variable: str | None = Non
     if variable:
         datasets = [d for d in datasets
                     if any(variable in str(v) for v in d.get("variables", []))]
-
     if not datasets:
         return {"summary": "未找到匹配的数据集。", "image_url": None}
 
@@ -36,12 +38,8 @@ def _query_weather_data(data_type: str | None = None, variable: str | None = Non
     return {"summary": head + "：\n" + "\n".join(lines), "image_url": None}
 
 
-def _run_model(model: str, region: str | None = None, time: str | None = None) -> dict:
-    return models.run_model(model=model, region=region, time=time)
-
-
 def _make_chart(title: str, series: Any = None, x: list | None = None) -> dict:
-    parsed: dict[str, list[float]] | None = None
+    parsed: dict | None = None
     if isinstance(series, str) and series.strip():
         try:
             parsed = json.loads(series)
@@ -53,35 +51,38 @@ def _make_chart(title: str, series: Any = None, x: list | None = None) -> dict:
     return {"summary": f"已生成图表：{title or '气象图表'}。", "image_url": url}
 
 
-# ── 分发表与进度文案 ────────────────────────────────────────────────────
-
-DISPATCH: dict[str, Callable[..., dict]] = {
+_LOCAL_DISPATCH = {
     "query_weather_data": _query_weather_data,
-    "run_model": _run_model,
     "make_chart": _make_chart,
 }
-
-# 工具卡上展示的中文进度文案
-LABELS = {
+_LOCAL_LABELS = {
     "query_weather_data": "查询数据中",
-    "run_model": "模型计算中",
     "make_chart": "生成图表中",
 }
 
 
+def label_for(name: str) -> str:
+    """工具卡进度文案。"""
+    return _LOCAL_LABELS.get(name) or models.label_for(name)
+
+
 def dispatch(name: str, args: dict[str, Any]) -> dict:
-    fn = DISPATCH.get(name)
-    if fn is None:
-        return {"summary": f"未知工具：{name}", "image_url": None}
+    """执行工具，返回带 status 的统一结构。"""
     try:
-        return fn(**(args or {}))
+        fn = _LOCAL_DISPATCH.get(name)
+        if fn is not None:
+            res = fn(**(args or {}))
+            res.setdefault("status", "ok")
+            return res
+        # 其余视为模型工具，交给注册表（含必填校验/缺参提示）
+        return models.run_model(name, args or {})
     except Exception as exc:  # 工具内部异常不应中断对话
-        return {"summary": f"工具 {name} 执行出错：{exc}", "image_url": None}
+        return {"status": "error", "summary": f"工具 {name} 执行出错：{exc}", "image_url": None}
 
 
-# ── OpenAI tools schema ─────────────────────────────────────────────────
+# ── 工具 schema：内置两个 + 6 个模型（自动生成）────────────────────────
 
-TOOL_SCHEMAS: list[dict[str, Any]] = [
+_BASE_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -101,23 +102,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "run_model",
-            "description": "调用气象预测模型并生成预测示意图。用户要求预测/外推/分析/跑模型时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "enum": ["wrf", "radar_ext", "era5", "himawari"],
-                              "description": "模型：wrf 短临降水、radar_ext 雷达回波外推、era5 场分析、himawari 葵花云图"},
-                    "region": {"type": "string", "description": "可选，目标区域，如 华北、长三角"},
-                    "time": {"type": "string", "description": "可选，时间，如 今天、未来6小时"},
-                },
-                "required": ["model"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "make_chart",
             "description": "把时序数据画成折线图并展示。用户要求生成图表/画图/可视化且无需跑模型时调用。",
             "parameters": {
@@ -125,10 +109,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "title": {"type": "string", "description": "图表标题"},
                     "series": {"type": "string",
-                               "description": "可选，JSON 字符串，形如 {\"气温(℃)\":[21,22,...]}；不填用示例数据"},
+                               "description": "可选，JSON 字符串，形如 {\"气温\":[21,22,...]}；不填用示例数据"},
                 },
                 "required": ["title"],
             },
         },
     },
 ]
+
+TOOL_SCHEMAS: list[dict[str, Any]] = _BASE_SCHEMAS + models.build_tool_schemas()

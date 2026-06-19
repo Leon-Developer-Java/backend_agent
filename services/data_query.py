@@ -11,7 +11,7 @@ from typing import Any
 
 from config import BACKEND_DATA_DIR
 
-# 内置示例清单（参考 backend_pro 的成员/变量），用于 data/ 为空时演示
+# 内置示例清单，用于解析后端 data/ 目录为空时演示（本后端不依赖其它后端服务）
 SAMPLE_DATASETS = [
     {"dataset_id": "era5_demo", "data_type": "ERA5", "title": "ERA5 再分析",
      "variables": ["温度", "气压", "风", "降水"], "times": 8, "png_count": 0},
