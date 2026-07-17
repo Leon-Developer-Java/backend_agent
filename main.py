@@ -18,9 +18,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent.llm import run_chat
+from auth import install_auth
 from config import DEEPSEEK_MODEL, OUTPUTS_DIR, has_llm
 
 app = FastAPI(title="Weather Agent Backend", version="0.1.0")
+
+# CORS 必须在 install_auth 之后 add_middleware，保证 401/403 响应带 CORS 头
+install_auth(app, [("/api/agent", 2), ("/outputs", 2)])
 
 app.add_middleware(
     CORSMiddleware,
